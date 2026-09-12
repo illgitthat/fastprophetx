@@ -1,0 +1,54 @@
+[project]
+name = "fastprophetx"
+version = "0.1.0"
+description = "Small, fast, dictionary-first ProphetX REST and WebSocket client"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Adam Bloom" }]
+requires-python = ">=3.14"
+dependencies = [
+    "httpx[http2]>=0.28.1",
+    "orjson>=3.11.3",
+    "websockets>=15.0.1",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/illgitthat/fastprophetx"
+Repository = "https://github.com/illgitthat/fastprophetx"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.3.0",
+    "pyright>=1.1.405",
+    "pytest>=8.4.2",
+    "ruff>=0.13.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+addopts = "-m 'not schema'"
+testpaths = ["tests"]
+markers = ["schema: checks the live ProphetX Swagger contract"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pyright]
+include = ["src", "tests", "scripts"]
+pythonVersion = "3.14"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false
