@@ -376,6 +376,7 @@ class ProphetXClient:
             "v4/mm/websocket",
             json={"socket_id": socket_id, "subscriptions": subscriptions},
             idempotent=True,
+            timeout=_registration_timeout(self._client.timeout),
         )
         data = _require_dict_data(payload, "v4/mm/websocket")
         _validate_registration(data, ids, pairs)
@@ -1305,6 +1306,23 @@ def _uncertain_order_response(
 
 def _string_or_none(value: Any) -> str | None:
     return str(value) if value is not None and str(value) else None
+
+
+# Registration can take several seconds server-side; a short client default
+# would time out every retry and leave the stream unregistered.
+_REGISTRATION_TIMEOUT_SECONDS = 30.0
+
+
+def _registration_timeout(timeout: httpx.Timeout) -> httpx.Timeout:
+    read = timeout.read
+    if read is not None and read >= _REGISTRATION_TIMEOUT_SECONDS:
+        return timeout
+    return httpx.Timeout(
+        timeout.connect,
+        read=_REGISTRATION_TIMEOUT_SECONDS,
+        write=timeout.write,
+        pool=timeout.pool,
+    )
 
 
 def _retry_delay(
