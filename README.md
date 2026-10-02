@@ -72,6 +72,11 @@ manager instead of environment variables.
 subscription changes. Reconcile through `MarketStore` before treating them as
 current again.
 
+`MarketStore.markets()` reuses each event's materialized markets until its
+books or structure change, so repeated reads are cheap. Each call returns new
+lists, but the market dictionaries are shared between reads; treat them as
+read-only.
+
 ```python
 from fastprophetx import MarketStore, ProphetXWebSocket
 
