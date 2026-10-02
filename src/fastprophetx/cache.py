@@ -37,6 +37,7 @@ class EventDepthSnapshot:
     valid: bool
     known_keys: frozenset[MarketKey]
     snapshots: dict[MarketKey, MarketSnapshot]
+    version: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +85,8 @@ class MarketCache:
         self._reconcile_revision_by_event: dict[int, int] = {}
         self._invalid_event_ids: set[int] = set()
         self._invalidation_epoch_by_event: dict[int, int] = {}
+        self._version_counter = 0
+        self._version_by_event: dict[int, int] = {}
         self._callbacks: list[CacheCallback] = []
         self._seeded_event_ids: set[int] = set()
         self._seeding_event_ids: set[int] = set()
@@ -206,6 +209,10 @@ class MarketCache:
                 return False
             if sequence is not None:
                 self._last_sequence[scope] = sequence
+            self._bump_versions_locked(
+                {prepared.key[0] for prepared in prepared_groups}
+                | ({event_id} if replace else set())
+            )
             if replace:
                 self._event_replace_at[event_id] = received_mono
                 changed_any = True
@@ -408,6 +415,7 @@ class MarketCache:
                 != request.invalidation_epochs[event_id]
             ):
                 return AuthoritativeApplyResult(accepted=False, changed=False)
+            self._bump_versions_locked({event_id, *(key[0] for key in rest_depth)})
             event_replace_at = self._event_replace_at.get(event_id)
             newer_event_replace = (
                 event_replace_at is not None
@@ -580,6 +588,7 @@ class MarketCache:
         if event_id <= 0:
             raise ValueError("event_id must be positive")
         with self._condition:
+            self._bump_versions_locked((event_id,))
             keys = {key for key in self._known_keys if key[0] == event_id}
             for key in keys:
                 self._snapshots.pop(key, None)
@@ -655,7 +664,29 @@ class MarketCache:
                     for key, snapshot in self._snapshots.items()
                     if key[0] == event_id
                 },
+                version=self._version_by_event.get(event_id, 0),
             )
+
+    def event_versions(self, event_ids: Iterable[int]) -> dict[int, tuple[int, bool]]:
+        """Return each event's ``(version, valid)`` without copying its depth.
+
+        An event's version changes whenever the contents of its
+        :meth:`event_snapshot` could change, so equal versions mean equal snapshots.
+        """
+
+        with self._lock:
+            return {
+                event_id: (
+                    self._version_by_event.get(event_id, 0),
+                    event_id not in self._invalid_event_ids,
+                )
+                for event_id in event_ids
+            }
+
+    def _bump_versions_locked(self, event_ids: Iterable[int]) -> None:
+        for event_id in event_ids:
+            self._version_counter += 1
+            self._version_by_event[event_id] = self._version_counter
 
     def invalidate_events(self, event_ids: Iterable[int]) -> None:
         ids = tuple(dict.fromkeys(event_ids))
@@ -670,6 +701,7 @@ class MarketCache:
                     self._invalidation_epoch_by_event.get(event_id, 0) + 1
                 )
             self._invalid_event_ids.update(ids)
+            self._bump_versions_locked(ids)
             self._condition.notify_all()
 
     def books_valid(self, event_ids: Iterable[int] | None = None) -> bool:

@@ -11,7 +11,12 @@ from .cache import EventDepthSnapshot, MarketCache, MarketKey
 
 
 class MarketStore:
-    """Own REST structure, reconciliation ordering, and executable live depth."""
+    """Own REST structure, reconciliation ordering, and executable live depth.
+
+    Materialized markets are cached per event and reused until that event's cache
+    version or structure changes. Returned lists are fresh, but their market
+    dictionaries are shared between reads and must be treated as read-only.
+    """
 
     def __init__(
         self,
@@ -32,6 +37,7 @@ class MarketStore:
         self._structures: dict[int, list[dict[str, Any]]] = {}
         self._blueprints: dict[int, list[dict[str, Any]]] = {}
         self._reconciled_at: dict[int, float] = {}
+        self._materialized: dict[int, tuple[int, list[dict[str, Any]]]] = {}
 
     def markets(
         self,
@@ -116,6 +122,7 @@ class MarketStore:
                         structure = retain_surviving_structure(state, blueprint)
                     self._structures[event_id] = structure
                     self._reconciled_at[event_id] = reconciled_at
+                    self._materialized.pop(event_id, None)
                 states = {
                     event_id: self.cache.event_snapshot(event_id) for event_id in ids
                 }
@@ -127,23 +134,34 @@ class MarketStore:
         max_age: float,
     ) -> dict[int, list[dict[str, Any]]] | None:
         now = self._monotonic()
-        states = {
-            event_id: self.cache.event_snapshot(event_id) for event_id in event_ids
-        }
         if not all(
             event_id in self._structures
-            and states[event_id].valid
             and now - self._reconciled_at.get(event_id, 0.0) < max_age
             for event_id in event_ids
         ):
             return None
-        return self._materialize_locked(event_ids, states)
+        versions = self.cache.event_versions(event_ids)
+        result: dict[int, list[dict[str, Any]]] = {}
+        for event_id in event_ids:
+            version, valid = versions[event_id]
+            if not valid:
+                return None
+            cached = self._materialized.get(event_id)
+            if cached is not None and cached[0] == version:
+                result[event_id] = list(cached[1])
+                continue
+            state = self.cache.event_snapshot(event_id)
+            if not state.valid:
+                return None
+            result[event_id] = self._materialize_event_locked(state)
+        return result
 
     def clear_event(self, event_id: int) -> None:
         with self._lock:
             self._structures.pop(event_id, None)
             self._blueprints.pop(event_id, None)
             self._reconciled_at.pop(event_id, None)
+            self._materialized.pop(event_id, None)
             self.cache.clear_event(event_id)
 
     def invalidate_events(self, event_ids: Iterable[int]) -> None:
@@ -154,20 +172,30 @@ class MarketStore:
         event_ids: Sequence[int],
         states: dict[int, EventDepthSnapshot],
     ) -> dict[int, list[dict[str, Any]]]:
-        result: dict[int, list[dict[str, Any]]] = {}
-        for event_id in event_ids:
-            state = states[event_id]
-            if not state.valid:
-                result[event_id] = []
-                continue
-            structure = self._structures.get(event_id, [])
-            if not structure:
-                structure = retain_surviving_structure(
-                    state,
-                    self._blueprints.get(event_id, []),
-                )
-            result[event_id] = materialize_markets(state, structure)
-        return result
+        return {
+            event_id: self._materialize_event_locked(states[event_id])
+            for event_id in event_ids
+        }
+
+    def _materialize_event_locked(
+        self,
+        state: EventDepthSnapshot,
+    ) -> list[dict[str, Any]]:
+        if not state.valid:
+            return []
+        event_id = state.event_id
+        cached = self._materialized.get(event_id)
+        if cached is not None and cached[0] == state.version:
+            return list(cached[1])
+        structure = self._structures.get(event_id, [])
+        if not structure:
+            structure = retain_surviving_structure(
+                state,
+                self._blueprints.get(event_id, []),
+            )
+        markets = materialize_markets(state, structure)
+        self._materialized[event_id] = (state.version, markets)
+        return list(markets)
 
 
 def _event_ids(values: Iterable[int]) -> tuple[int, ...]:
