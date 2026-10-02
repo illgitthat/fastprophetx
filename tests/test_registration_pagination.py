@@ -128,6 +128,41 @@ def test_registration_validation(make_client: Any, change: dict[str, Any]) -> No
         make_client(handler).register_websocket("1.2", [1])
 
 
+def test_registration_waits_longer_than_the_default_read_timeout(
+    make_client: Any,
+) -> None:
+    timeouts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth/login"):
+            return _login(request)
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "success": True,
+                    "status": "CONNECTED",
+                    "authorized_channel": [
+                        _global_channel("private-user"),
+                        _global_channel("private-tournaments"),
+                        _channel(1),
+                    ],
+                    "channel_count": 1,
+                    "channel_limit": 100,
+                    "rejected": [],
+                    "subscriptions": [],
+                }
+            },
+            request=request,
+        )
+
+    client = make_client(handler)
+    client.register_websocket("1.2", [1])
+
+    assert timeouts[-1]["read"] >= 30
+
+
 def test_pagination_and_find_external_id(make_client: Any) -> None:
     cursors: list[str | None] = []
 
