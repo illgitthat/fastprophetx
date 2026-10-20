@@ -169,7 +169,8 @@ class MarketCache:
             raise TypeError("market update payload must be a dictionary")
         if sequence is None:
             sequence = _extract_sequence(payload)
-        scope = (event_id, subtype, *_line_identity(payload))
+        line = _line_identity(payload)
+        scope = (event_id, subtype, *line)
         received_mono = (
             self._monotonic()
             if received_at_monotonic is None
@@ -204,10 +205,15 @@ class MarketCache:
         changed_any = False
         with self._condition:
             previous_sequence = self._last_sequence.get(scope)
+            # A line can send several different updates with one sequence
+            # number, so only an older one is stale there.
             if (
                 sequence is not None
                 and previous_sequence is not None
-                and sequence <= previous_sequence
+                and (
+                    sequence < previous_sequence
+                    or (sequence == previous_sequence and not line)
+                )
             ):
                 return False
             if sequence is not None:

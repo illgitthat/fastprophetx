@@ -635,10 +635,13 @@ def _line_update(market_id: int, strike_id: str, price: int, sequence: int) -> d
 def test_sequence_numbers_are_compared_per_market_line() -> None:
     cache = MarketCache()
     first, second = (1, "10", "a", "1"), (1, "11", "b", "1")
-    cache.apply_update(1, _line_update(10, "a", 100, sequence=2_000))
+    cache.apply_update(1, _line_update(10, "a", 110, sequence=2_000))
     # Another line with a lower sequence is not stale: each line counts its own.
-    assert cache.apply_update(1, _line_update(11, "b", 120, sequence=1_000))
-    assert cache.current_levels(second)[0].price == 120
+    assert cache.apply_update(1, _line_update(11, "b", 130, sequence=1_000))
+    assert cache.current_levels(second)[0].price == 130
     # An older update for the same line is.
-    assert not cache.apply_update(1, _line_update(10, "a", 90, sequence=1_500))
-    assert cache.current_levels(first)[0].price == 100
+    assert not cache.apply_update(1, _line_update(10, "a", 105, sequence=1_500))
+    assert cache.current_levels(first)[0].price == 110
+    # Several updates of one line can share a sequence number.
+    assert cache.apply_update(1, _line_update(10, "a", 120, sequence=2_000))
+    assert cache.current_levels(first)[0].price == 120
