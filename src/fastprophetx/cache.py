@@ -80,7 +80,10 @@ class MarketCache:
         ] = {}
         self._selection_layout_observed_at: dict[tuple[int, str], float] = {}
         self._last_update_at_by_event: dict[int, float] = {}
-        self._last_sequence: dict[tuple[int, str | None], int] = {}
+        # Last sequence per (event, subtype) or, for payloads that identify a
+        # market line, per line: ``sequence_number`` increases per market line,
+        # so lines must not be compared with each other.
+        self._last_sequence: dict[tuple[Any, ...], int] = {}
         self._reconcile_revision = 0
         self._reconcile_revision_by_event: dict[int, int] = {}
         self._invalid_event_ids: set[int] = set()
@@ -166,7 +169,8 @@ class MarketCache:
             raise TypeError("market update payload must be a dictionary")
         if sequence is None:
             sequence = _extract_sequence(payload)
-        scope = (event_id, subtype)
+        line = _line_identity(payload)
+        scope = (event_id, subtype, *line)
         received_mono = (
             self._monotonic()
             if received_at_monotonic is None
@@ -201,10 +205,15 @@ class MarketCache:
         changed_any = False
         with self._condition:
             previous_sequence = self._last_sequence.get(scope)
+            # A line can send several different updates with one sequence
+            # number, so only an older one is stale there.
             if (
                 sequence is not None
                 and previous_sequence is not None
-                and sequence <= previous_sequence
+                and (
+                    sequence < previous_sequence
+                    or (sequence == previous_sequence and not line)
+                )
             ):
                 return False
             if sequence is not None:
@@ -846,6 +855,19 @@ def _prepare_group(
         seen_prices=frozenset(
             {level.price for level in normalized} | set(deletion_prices)
         ),
+    )
+
+
+def _line_identity(payload: dict[str, Any]) -> tuple[Any, ...]:
+    """Market line of a ``market_selections`` update, or () if none."""
+    info = payload.get("info")
+    if not isinstance(info, dict) or ("market_id" not in payload and "id" not in info):
+        return ()
+    return (
+        payload.get("market_id"),
+        info.get("id"),
+        info.get("strike"),
+        info.get("name"),
     )
 
 
