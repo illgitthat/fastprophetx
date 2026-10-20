@@ -609,3 +609,36 @@ def test_cache_callbacks_wait_and_seed_once() -> None:
     assert client.calls == 1
     assert len(callbacks) == 1
     assert cache.wait_for_update(after_monotonic=0, timeout=0) is True
+
+
+def _line_update(market_id: int, strike_id: str, price: int, sequence: int) -> dict:
+    return {
+        "sport_event_id": 1,
+        "market_id": market_id,
+        "info": {
+            "id": market_id,
+            "sequence_number": sequence,
+            "selections": [
+                [
+                    {
+                        "strike_id": strike_id,
+                        "outcome_id": 1,
+                        "price": price,
+                        "quantity": 5,
+                    }
+                ]
+            ],
+        },
+    }
+
+
+def test_sequence_numbers_are_compared_per_market_line() -> None:
+    cache = MarketCache()
+    first, second = (1, "10", "a", "1"), (1, "11", "b", "1")
+    cache.apply_update(1, _line_update(10, "a", 100, sequence=2_000))
+    # Another line with a lower sequence is not stale: each line counts its own.
+    assert cache.apply_update(1, _line_update(11, "b", 120, sequence=1_000))
+    assert cache.current_levels(second)[0].price == 120
+    # An older update for the same line is.
+    assert not cache.apply_update(1, _line_update(10, "a", 90, sequence=1_500))
+    assert cache.current_levels(first)[0].price == 100
