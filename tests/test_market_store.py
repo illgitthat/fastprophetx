@@ -258,6 +258,28 @@ def test_repeated_reads_reflect_only_later_updates() -> None:
     assert first == first_copy
 
 
+def test_update_to_one_market_reuses_the_others() -> None:
+    # Callers skip re-parsing a market whose dict is the same object.
+    class Client:
+        def get_multiple_markets(
+            self,
+            _event_ids: object,
+        ) -> dict[str, list[dict[str, Any]]]:
+            return {"1": [market(10, "strike-1", -110), market(20, "strike-2", 105)]}
+
+    store = MarketStore(Client())
+    store.refresh([1])
+    first = store.markets([1])[1]
+
+    store.cache.apply_update(1, price_update(20, "strike-2", 120))
+    updated = store.markets([1])[1]
+
+    assert updated[0] is first[0]
+    assert updated[1] is not first[1]
+    assert updated[1]["selections"][0][0]["price"] == 120
+    assert first[1]["selections"][0][0]["price"] == 105
+
+
 def test_invalidated_event_is_not_served_from_previous_read() -> None:
     class Client:
         def __init__(self) -> None:
