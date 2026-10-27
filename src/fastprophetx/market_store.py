@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 from .cache import EventDepthSnapshot, MarketCache, MarketKey
 
@@ -38,6 +38,9 @@ class MarketStore:
         self._blueprints: dict[int, list[dict[str, Any]]] = {}
         self._reconciled_at: dict[int, float] = {}
         self._materialized: dict[int, tuple[int, list[dict[str, Any]]]] = {}
+        # Per event: the structure last materialized and, per market, its
+        # selection keys, their snapshots then, and the market built from them.
+        self._market_parts: dict[int, tuple[list[dict[str, Any]], list[_Part]]] = {}
 
     def markets(
         self,
@@ -162,6 +165,7 @@ class MarketStore:
             self._blueprints.pop(event_id, None)
             self._reconciled_at.pop(event_id, None)
             self._materialized.pop(event_id, None)
+            self._market_parts.pop(event_id, None)
             self.cache.clear_event(event_id)
 
     def invalidate_events(self, event_ids: Iterable[int]) -> None:
@@ -193,9 +197,53 @@ class MarketStore:
                 state,
                 self._blueprints.get(event_id, []),
             )
-        markets = materialize_markets(state, structure)
+        markets = self._materialize_changed_locked(state, structure)
         self._materialized[event_id] = (state.version, markets)
         return list(markets)
+
+    def _materialize_changed_locked(
+        self,
+        state: EventDepthSnapshot,
+        structure: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Rebuild only markets whose selections changed; reuse the others' dicts.
+
+        A change to one market (a player prop) bumps the whole event's version;
+        rebuilding every market of a large event on each change cost the arb loop
+        most of a pricing pass. Snapshots are replaced, never mutated, so an
+        unchanged market has the same snapshot objects.
+        """
+        previous = self._market_parts.get(state.event_id)
+        old_parts = (
+            previous[1] if previous is not None and previous[0] is structure else []
+        )
+        parts: list[_Part] = []
+        for index, market in enumerate(structure):
+            old = old_parts[index] if index < len(old_parts) else None
+            if old is not None:
+                current = _key_snapshots(state, old.keys)
+                if all(a is b for a, b in zip(current, old.snapshots, strict=True)):
+                    parts.append(old)
+                    continue
+            keys: list[MarketKey] = []
+            built = _materialize_market(state, market, keys=keys)
+            parts.append(_Part(tuple(keys), _key_snapshots(state, keys), built))
+        self._market_parts[state.event_id] = (structure, parts)
+        return [part.market for part in parts]
+
+
+class _Part(NamedTuple):
+    keys: tuple[MarketKey, ...]
+    snapshots: tuple[Any, ...]
+    market: dict[str, Any]
+
+
+def _key_snapshots(
+    state: EventDepthSnapshot, keys: Iterable[MarketKey]
+) -> tuple[Any, ...]:
+    return tuple(
+        state.snapshots.get(key) if key in state.known_keys else None for key in keys
+    )
 
 
 def _event_ids(values: Iterable[int]) -> tuple[int, ...]:
@@ -328,6 +376,7 @@ def _materialize_market(
     market: dict[str, Any],
     *,
     parent_market_id: str | int | None = None,
+    keys: list[MarketKey] | None = None,
 ) -> dict[str, Any]:
     result = dict(market)
     market_id = market.get("market_id")
@@ -339,7 +388,7 @@ def _materialize_market(
     selections = market.get("selections")
     if isinstance(selections, list):
         result["selections"] = [
-            _materialize_group(state, market_id, strike_id, levels)
+            _materialize_group(state, market_id, strike_id, levels, keys)
             if isinstance(levels, list)
             else []
             for levels in selections
@@ -351,6 +400,7 @@ def _materialize_market(
                 state,
                 child,
                 parent_market_id=market_id,
+                keys=keys,
             )
             for child in strikes
             if isinstance(child, dict)
@@ -363,6 +413,7 @@ def _materialize_group(
     market_id: str | int | None,
     strike_id: str | int | None,
     levels: list[Any],
+    keys: list[MarketKey] | None = None,
 ) -> list[dict[str, Any]]:
     representatives: dict[MarketKey, dict[str, Any]] = {}
     for level in levels:
@@ -376,6 +427,8 @@ def _materialize_group(
         )
         if key is not None and key not in representatives:
             representatives[key] = level
+    if keys is not None:
+        keys.extend(representatives)
     materialized: list[dict[str, Any]] = []
     for key, base in representatives.items():
         snapshot = state.snapshots.get(key)

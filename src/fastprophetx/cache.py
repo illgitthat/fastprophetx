@@ -66,6 +66,10 @@ class MarketCache:
         self._condition = threading.Condition(self._lock)
         self._snapshots: dict[MarketKey, MarketSnapshot] = {}
         self._known_keys: set[MarketKey] = set()
+        # Per-event views of the two above, so event reads and event-wide
+        # changes cost that event's keys, not every key of every event.
+        self._snapshots_by_event: dict[int, dict[MarketKey, MarketSnapshot]] = {}
+        self._known_by_event: dict[int, set[MarketKey]] = {}
         self._observed_at_by_key: dict[MarketKey, float] = {}
         self._level_changes: dict[
             tuple[MarketKey, int],
@@ -230,14 +234,10 @@ class MarketCache:
                         del self._selection_keys_by_market[layout_key]
                         self._selection_layout_observed_at.pop(layout_key, None)
                 present_keys = {key for key, _, _ in groups}
-                stale_keys = {
-                    key
-                    for key in self._known_keys
-                    if key[0] == event_id and key not in present_keys
-                }
+                stale_keys = self._event_keys_locked(event_id) - present_keys
                 for key in stale_keys:
-                    self._snapshots.pop(key, None)
-                    self._known_keys.discard(key)
+                    self._drop_snapshot_locked(key)
+                    self._forget_key_locked(key)
                     self._observed_at_by_key.pop(key, None)
                     self._membership_removals[key] = received_mono
                     for change_key in tuple(self._level_changes):
@@ -248,7 +248,7 @@ class MarketCache:
                 key = prepared.key
                 replace_levels = prepared.replace_levels
                 was_known = key in self._known_keys
-                self._known_keys.add(key)
+                self._know_key_locked(key)
                 self._observed_at_by_key[key] = received_mono
                 if replace_levels:
                     self._selection_resets[key] = received_mono
@@ -283,7 +283,7 @@ class MarketCache:
                     }
                 if not depth:
                     if key in self._snapshots:
-                        del self._snapshots[key]
+                        self._drop_snapshot_locked(key)
                         changed_any = True
                     elif not was_known:
                         changed_any = True
@@ -315,7 +315,7 @@ class MarketCache:
                     ),
                     subtype=subtype,
                 )
-                self._snapshots[key] = snapshot
+                self._store_snapshot_locked(key, snapshot)
                 changed.append(snapshot)
                 changed_any = True
             self._selection_keys_by_market.update(layout_updates)
@@ -473,7 +473,7 @@ class MarketCache:
                     newer_changes_by_key[key].append((changed_at, price, level))
             newer_change_keys = set(newer_changes_by_key)
             keys = (
-                {key for key in self._known_keys if key[0] == event_id}
+                self._event_keys_locked(event_id)
                 | (set() if newer_event_replace else set(rest_depth))
                 | newer_reset_keys
                 | set(newer_membership_removals)
@@ -535,17 +535,17 @@ class MarketCache:
                 if not keep_key:
                     if key in self._known_keys:
                         changed_any = True
-                    self._snapshots.pop(key, None)
-                    self._known_keys.discard(key)
+                    self._drop_snapshot_locked(key)
+                    self._forget_key_locked(key)
                     self._observed_at_by_key.pop(key, None)
                     continue
 
-                self._known_keys.add(key)
+                self._know_key_locked(key)
                 self._observed_at_by_key[key] = latest_change_at
                 if not depth:
                     if old is not None:
                         changed_any = True
-                    self._snapshots.pop(key, None)
+                    self._drop_snapshot_locked(key)
                     continue
 
                 levels = tuple(
@@ -570,7 +570,7 @@ class MarketCache:
                 if old != snapshot:
                     changed_any = True
                     changed.append(snapshot)
-                self._snapshots[key] = snapshot
+                self._store_snapshot_locked(key, snapshot)
 
             for change_key in tuple(self._level_changes):
                 if change_key[0][0] == event_id:
@@ -598,10 +598,10 @@ class MarketCache:
             raise ValueError("event_id must be positive")
         with self._condition:
             self._bump_versions_locked((event_id,))
-            keys = {key for key in self._known_keys if key[0] == event_id}
+            keys = self._event_keys_locked(event_id)
             for key in keys:
-                self._snapshots.pop(key, None)
-                self._known_keys.discard(key)
+                self._drop_snapshot_locked(key)
+                self._forget_key_locked(key)
                 self._observed_at_by_key.pop(key, None)
                 self._selection_resets.pop(key, None)
                 self._membership_removals.pop(key, None)
@@ -649,11 +649,9 @@ class MarketCache:
 
     def known_keys(self, *, event_id: int | None = None) -> frozenset[MarketKey]:
         with self._lock:
-            return frozenset(
-                key
-                for key in self._known_keys
-                if event_id is None or key[0] == event_id
-            )
+            if event_id is None:
+                return frozenset(self._known_keys)
+            return frozenset(self._known_by_event.get(event_id, ()))
 
     def event_snapshot(self, event_id: int) -> EventDepthSnapshot:
         """Return known keys and live depth from one cache lock acquisition."""
@@ -661,18 +659,11 @@ class MarketCache:
         if event_id <= 0:
             raise ValueError("event_id must be positive")
         with self._lock:
-            known_keys = frozenset(
-                key for key in self._known_keys if key[0] == event_id
-            )
             return EventDepthSnapshot(
                 event_id=event_id,
                 valid=event_id not in self._invalid_event_ids,
-                known_keys=known_keys,
-                snapshots={
-                    key: snapshot
-                    for key, snapshot in self._snapshots.items()
-                    if key[0] == event_id
-                },
+                known_keys=frozenset(self._known_by_event.get(event_id, ())),
+                snapshots=dict(self._snapshots_by_event.get(event_id, {})),
                 version=self._version_by_event.get(event_id, 0),
             )
 
@@ -691,6 +682,33 @@ class MarketCache:
                 )
                 for event_id in event_ids
             }
+
+    def _event_keys_locked(self, event_id: int) -> set[MarketKey]:
+        return set(self._known_by_event.get(event_id, ()))
+
+    def _know_key_locked(self, key: MarketKey) -> None:
+        self._known_keys.add(key)
+        self._known_by_event.setdefault(key[0], set()).add(key)
+
+    def _forget_key_locked(self, key: MarketKey) -> None:
+        self._known_keys.discard(key)
+        keys = self._known_by_event.get(key[0])
+        if keys is not None:
+            keys.discard(key)
+            if not keys:
+                del self._known_by_event[key[0]]
+
+    def _store_snapshot_locked(self, key: MarketKey, snapshot: MarketSnapshot) -> None:
+        self._snapshots[key] = snapshot
+        self._snapshots_by_event.setdefault(key[0], {})[key] = snapshot
+
+    def _drop_snapshot_locked(self, key: MarketKey) -> None:
+        self._snapshots.pop(key, None)
+        snapshots = self._snapshots_by_event.get(key[0])
+        if snapshots is not None:
+            snapshots.pop(key, None)
+            if not snapshots:
+                del self._snapshots_by_event[key[0]]
 
     def _bump_versions_locked(self, event_ids: Iterable[int]) -> None:
         for event_id in event_ids:
@@ -733,9 +751,14 @@ class MarketCache:
     ) -> dict[MarketKey, MarketSnapshot]:
         market = str(market_id) if market_id is not None else None
         with self._lock:
+            source = (
+                self._snapshots
+                if event_id is None
+                else self._snapshots_by_event.get(event_id, {})
+            )
             return {
                 key: value
-                for key, value in self._snapshots.items()
+                for key, value in source.items()
                 if key[0] not in self._invalid_event_ids
                 if (event_id is None or key[0] == event_id)
                 and (market is None or key[1] == market)
