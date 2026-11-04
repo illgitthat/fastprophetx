@@ -1172,11 +1172,16 @@ def _order_payload(intent: OrderIntent, ladder: frozenset[int]) -> dict[str, Any
         raise TypeError("quantity must be numeric")
     if intent.quantity <= 0:
         raise ValueError("quantity must be positive")
+    # ProphetX renamed fillOrKill to immediateOrCancel (changelog Oct 27 - Nov 2,
+    # 2026); both are accepted.
     if intent.order_strategy is not None and intent.order_strategy not in {
+        "immediateOrCancel",
         "fillOrKill",
         "ALO",
     }:
-        raise ValueError("order_strategy must be fillOrKill, ALO, or None")
+        raise ValueError(
+            "order_strategy must be immediateOrCancel, fillOrKill, ALO, or None"
+        )
     payload = {
         "external_id": intent.external_id,
         "strike_id": intent.strike_id,

@@ -139,7 +139,7 @@ result = client.submit_order(
         strike_id="prophetx-strike-id",
         price=-110,
         quantity=10.0,
-        order_strategy="fillOrKill",
+        order_strategy="immediateOrCancel",
     )
 )
 ```

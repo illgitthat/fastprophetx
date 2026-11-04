@@ -321,11 +321,13 @@ def test_normal_order_omits_strategy_and_explicit_strategy_is_preserved(
         [
             OrderIntent("normal", "strike", -110, 1),
             OrderIntent("post-only", "strike", -110, 1, "ALO"),
+            OrderIntent("ioc", "strike", -110, 1, "immediateOrCancel"),
         ]
     )
 
     assert "order_strategy" not in submitted[0][0]
     assert submitted[0][1]["order_strategy"] == "ALO"
+    assert submitted[0][2]["order_strategy"] == "immediateOrCancel"
 
 
 def test_submit_order_returns_typed_result(make_client: Any) -> None:
